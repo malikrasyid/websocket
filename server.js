@@ -1,4 +1,5 @@
-const WebSocket = require('ws');
+const http = require('http');
+const { Server } = require('socket.io');
 const admin = require('firebase-admin');
 
 const firebaseConfig = {
@@ -42,90 +43,284 @@ try {
 
 const db = admin.firestore();
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
 
-const clients = new Set();
+// Create HTTP server
+const server = http.createServer();
 
-wss.on('connection', (ws) => {
-    console.log('Client connected');
-    clients.add(ws);
-
-    ws.on('close', () => {
-        console.log('Client disconnected');
-        clients.delete(ws);
-    });
+// Initialize Socket.IO with CORS settings
+const io = new Server(server, {
+  cors: {
+    origin: "*", // Allow all origins
+    methods: ["GET", "POST"]
+  }
 });
 
-// Function to broadcast data to all connected clients
-const broadcast = (message) => {
-    clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify(message));
-        }
+// Start the server
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
+
+// Create namespaces
+const projectsNamespace = io.of('/projects');
+const tasksNamespace = io.of('/tasks');
+const usersNamespace = io.of('/users');
+const commentsNamespace = io.of('/comments');
+const notificationsNamespace = io.of('/notifications');
+
+// Main namespace (/)
+io.on('connection', (socket) => {
+  console.log(`[Main] Client connected: ${socket.id}`);
+  
+  // Join a room
+  socket.on('join_room', (room) => {
+    socket.join(room);
+    console.log(`[Main] Client ${socket.id} joined room: ${room}`);
+    socket.emit('room_joined', { room });
+  });
+  
+  // Leave a room
+  socket.on('leave_room', (room) => {
+    socket.leave(room);
+    console.log(`[Main] Client ${socket.id} left room: ${room}`);
+    socket.emit('room_left', { room });
+  });
+  
+  // Send message to a specific room
+  socket.on('send_room_message', ({ room, message }) => {
+    io.to(room).emit('room_message', { 
+      sender: socket.id,
+      room,
+      message,
+      time: new Date().toISOString()
     });
-};
+  });
+  
+  // Custom event handling
+  socket.on('custom_event', (data) => {
+    console.log(`[Main] Received custom event from ${socket.id}:`, data);
+    socket.emit('custom_response', { 
+      message: 'Custom event received',
+      data
+    });
+  });
+  
+  socket.on('disconnect', () => {
+    console.log(`[Main] Client disconnected: ${socket.id}`);
+  });
+});
+
+// Projects namespace
+projectsNamespace.on('connection', (socket) => {
+  console.log(`[Projects] Client connected: ${socket.id}`);
+  
+  socket.on('join_project', (projectId) => {
+    socket.join(`project:${projectId}`);
+    console.log(`[Projects] Client ${socket.id} joined project: ${projectId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log(`[Projects] Client disconnected: ${socket.id}`);
+  });
+});
+
+// Tasks namespace
+tasksNamespace.on('connection', (socket) => {
+  console.log(`[Tasks] Client connected: ${socket.id}`);
+  
+  socket.on('join_task', (taskId) => {
+    socket.join(`task:${taskId}`);
+    console.log(`[Tasks] Client ${socket.id} joined task: ${taskId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log(`[Tasks] Client disconnected: ${socket.id}`);
+  });
+});
+
+// Users namespace
+usersNamespace.on('connection', (socket) => {
+  console.log(`[Users] Client connected: ${socket.id}`);
+  
+  socket.on('follow_user', (userId) => {
+    socket.join(`user:${userId}`);
+    console.log(`[Users] Client ${socket.id} following user: ${userId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log(`[Users] Client disconnected: ${socket.id}`);
+  });
+});
+
+// Comments namespace
+commentsNamespace.on('connection', (socket) => {
+  console.log(`[Comments] Client connected: ${socket.id}`);
+  
+  socket.on('join_comment_thread', (taskId) => {
+    socket.join(`comments:${taskId}`);
+    console.log(`[Comments] Client ${socket.id} joined comment thread for task: ${taskId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log(`[Comments] Client disconnected: ${socket.id}`);
+  });
+});
+
+// Notifications namespace
+notificationsNamespace.on('connection', (socket) => {
+  console.log(`[Notifications] Client connected: ${socket.id}`);
+  
+  socket.on('subscribe_user', (userId) => {
+    socket.join(`user:${userId}`);
+    console.log(`[Notifications] Client ${socket.id} subscribed to user: ${userId}`);
+  });
+  
+  socket.on('disconnect', () => {
+    console.log(`[Notifications] Client disconnected: ${socket.id}`);
+  });
+});
 
 // **1. Listen for changes in "projects" collection**
 db.collection('projects').onSnapshot(snapshot => {
-    snapshot.docChanges().forEach(change => {
-        broadcast({
-            type: 'project_update',  // Changed to match client expectations
-            action: change.type,     // Store the original action type (created, modified, removed)
-            projectId: change.doc.id, // Include projectId for client-side filtering
-            data: { id: change.doc.id, ...change.doc.data() }
-        });
+  snapshot.docChanges().forEach(change => {
+    const data = change.doc.data();
+    const projectId = change.doc.id;
+    
+    // Send to main namespace for all clients
+    io.emit('update', {
+      type: 'project_update',
+      action: change.type,
+      projectId: projectId,
+      data: { id: projectId, ...data }
     });
+    
+    // Send to specific project room in projects namespace
+    projectsNamespace.to(`project:${projectId}`).emit('project_updated', {
+      action: change.type,
+      projectId: projectId,
+      data: { id: projectId, ...data }
+    });
+  });
 }, error => {
-    console.error("🚨 Error Firestore listener:", error);
+  console.error("🚨 Error Firestore listener:", error);
 });
 
 // **2. Listen for changes in "tasks" collection**
 db.collectionGroup('tasks').onSnapshot(snapshot => {
-    snapshot.docChanges().forEach(change => {
-        broadcast({
-            type: 'task_update',     // Changed to match client expectations
-            action: change.type,     // Store the original action type
-            projectId: data.projectId, // Include projectId for client-side filtering
-            taskId: change.doc.id,
-            data: { id: change.doc.id, ...data }
-        });
+  snapshot.docChanges().forEach(change => {
+    const data = change.doc.data();
+    const taskId = change.doc.id;
+    const projectId = data.projectId;
+    
+    // Send to main namespace for all clients
+    io.emit('update', {
+      type: 'task_update',
+      action: change.type,
+      projectId: projectId,
+      taskId: taskId,
+      data: { id: taskId, ...data }
     });
+    
+    // Send to specific project room in projects namespace
+    projectsNamespace.to(`project:${projectId}`).emit('task_updated', {
+      action: change.type,
+      projectId: projectId,
+      taskId: taskId,
+      data: { id: taskId, ...data }
+    });
+    
+    // Send to specific task room in tasks namespace
+    tasksNamespace.to(`task:${taskId}`).emit('task_updated', {
+      action: change.type,
+      projectId: projectId,
+      taskId: taskId,
+      data: { id: taskId, ...data }
+    });
+  });
 });
 
 // **3. Listen for changes in "users" collection**
 db.collection('users').onSnapshot(snapshot => {
-    snapshot.docChanges().forEach(change => {
-        broadcast({
-            type: 'user_update',     // Changed to a more appropriate type
-            action: change.type,
-            userId: change.doc.id,
-            data: { id: change.doc.id, ...change.doc.data() }
-        });
+  snapshot.docChanges().forEach(change => {
+    const data = change.doc.data();
+    const userId = change.doc.id;
+    
+    // Send to main namespace for all clients
+    io.emit('update', {
+      type: 'user_update',
+      action: change.type,
+      userId: userId,
+      data: { id: userId, ...data }
     });
+    
+    // Send to specific user room in users namespace
+    usersNamespace.to(`user:${userId}`).emit('user_updated', {
+      action: change.type,
+      userId: userId,
+      data: { id: userId, ...data }
+    });
+  });
 });
 
 // **4. Listen for changes in "comments" collection**
 db.collection('comments').onSnapshot(snapshot => {
-    snapshot.docChanges().forEach(change => {
-        broadcast({
-            type: 'comment_update',  // Fixed: was incorrectly using 'user:${change.type}'
-            action: change.type,
-            projectId: data.projectId,
-            taskId: data.taskId,
-            commentId: change.doc.id,
-            data: { id: change.doc.id, ...data }
-        });
+  snapshot.docChanges().forEach(change => {
+    const data = change.doc.data();
+    const commentId = change.doc.id;
+    const projectId = data.projectId;
+    const taskId = data.taskId;
+    
+    // Send to main namespace for all clients
+    io.emit('update', {
+      type: 'comment_update',
+      action: change.type,
+      projectId: projectId,
+      taskId: taskId,
+      commentId: commentId,
+      data: { id: commentId, ...data }
     });
+    
+    // Send to specific task room in tasks namespace
+    tasksNamespace.to(`task:${taskId}`).emit('comment_updated', {
+      action: change.type,
+      projectId: projectId,
+      taskId: taskId,
+      commentId: commentId,
+      data: { id: commentId, ...data }
+    });
+    
+    // Send to specific comment thread in comments namespace
+    commentsNamespace.to(`comments:${taskId}`).emit('comment_updated', {
+      action: change.type,
+      projectId: projectId,
+      taskId: taskId,
+      commentId: commentId,
+      data: { id: commentId, ...data }
+    });
+  });
 });
 
 // **5. Listen for changes in "notifications" collection**
 db.collection('notifications').onSnapshot(snapshot => {
-    snapshot.docChanges().forEach(change => {
-        broadcast({
-            type: 'notification_update',  // Fixed: was incorrectly using 'user:${change.type}'
-            action: change.type,
-            userId: data.userId,  // Assuming notifications have a userId field
-            data: { id: change.doc.id, ...data }
-        });
+  snapshot.docChanges().forEach(change => {
+    const data = change.doc.data();
+    const notificationId = change.doc.id;
+    const userId = data.userId;
+    
+    // Send to main namespace for all clients
+    io.emit('update', {
+      type: 'notification_update',
+      action: change.type,
+      userId: userId,
+      notificationId: notificationId,
+      data: { id: notificationId, ...data }
     });
+    
+    // Send to specific user in notifications namespace
+    notificationsNamespace.to(`user:${userId}`).emit('notification', {
+      action: change.type,
+      userId: userId,
+      notificationId: notificationId,
+      data: { id: notificationId, ...data }
+    });
+  });
 });
